@@ -3,127 +3,130 @@
 using namespace std::chrono_literals;
 
 NavSimple::NavSimple()
-    : Node("nav_simple"), threshold_range(1.5), autonomous_mode(0), p_gain(0.05), maximum_range(10.0) {
-    publisher = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
-    subscription_arrow = create_subscription<sensor_msgs::msg::JointState>(
-        "arrow_detection", 10, std::bind(&NavSimple::callback, this, std::placeholders::_1));
-    subscription_commands = create_subscription<sensor_msgs::msg::JointState>(
-        "autonomous_commands", 10, std::bind(&NavSimple::callback_2, this, std::placeholders::_1));
+  : Node("nav_simple_cv"),
+    threshold_range(1.5),
+    autonomous_mode(false)
+{
+  publisher = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+  subscription_arrow = create_subscription<sensor_msgs::msg::JointState>(
+      "arrow_detection", 10, std::bind(&NavSimple::callback, this, std::placeholders::_1));
+  subscription_commands = create_subscription<sensor_msgs::msg::JointState>(
+      "autonomous_commands", 10, std::bind(&NavSimple::callback_2, this, std::placeholders::_1));
 
-    RCLCPP_INFO(get_logger(), "NavSimple started!");
-    std::thread(&NavSimple::pipeline, this).detach();
+  p_gain = declare_parameter("pid_gain", 0.05);
+  maximum_range = declare_parameter("maximum_range", 10.0);
+
+  pipeline = create_wall_timer(5s, [this]() {
+              if (autonomous_mode && findArrow())
+              {
+                approachArrow();
+              }});
+
+  RCLCPP_INFO(get_logger(), "NavSimple started!");
 }
 
-NavSimple::~NavSimple() {
-    RCLCPP_INFO(get_logger(), "NavSimple stopped!");
+NavSimple::~NavSimple()
+{
+  RCLCPP_INFO(get_logger(), "NavSimple stopped!");
 }
 
-void NavSimple::callback(const sensor_msgs::msg::JointState::SharedPtr msg) {
-    arrow_direction = msg->name;
-    arrow_range = msg->position;
-    arrow_angle = msg->velocity;
-    arrow_certainty = msg->effort;
+void NavSimple::callback(const sensor_msgs::msg::JointState::SharedPtr msg)
+{
+  size_t msg_size = msg->name.size();
+
+  arrow_vector.clear();
+  arrow_vector.reserve(msg_size);
+
+  auto pos = arrow_vector.begin();
+
+  for(size_t i = 0; i < msg_size; ++i)
+  {
+    pos = arrow_vector.emplace(pos, msg->name[i], msg->position[i], msg->velocity[i], msg->effort[i]);
+  }
 }
 
-void NavSimple::callback_2(const sensor_msgs::msg::JointState::SharedPtr msg) {
-    if (auto it = std::find(msg->name.begin(), msg->name.end(), "autonomous_mode"); it != msg->name.end()) {
-        autonomous_mode = msg->position[std::distance(msg->name.begin(), it)];
-    }
+void NavSimple::callback_2(const sensor_msgs::msg::JointState::SharedPtr msg)
+{
+  if (auto it = std::find(msg->name.begin(), msg->name.end(), "autonomous_mode"); it != msg->name.end())
+    autonomous_mode = msg->position[std::distance(msg->name.begin(), it)];
 }
 
-std::optional<std::tuple<double, double, double>> NavSimple::arrowFilter(
-    double range_min, double range_max, double angle_max, double certainty_min) {
-    if (!arrow_range.empty()) {
-        for (size_t i = 0; i < arrow_range.size(); ++i) {
-            if (arrow_range[i] > range_min && arrow_range[i] < range_max &&
-                std::abs(arrow_angle[i]) < angle_max && arrow_certainty[i] > certainty_min) {
-                return std::make_tuple(arrow_range[i], arrow_angle[i], arrow_certainty[i]);
-            }
-        }
-    }
-    return std::nullopt;
+
+auto NavSimple::arrowFilter(double range_min, double range_max, double angle_max, double certainty_min)
+{
+  return std::find_if(arrow_vector.begin(), arrow_vector.end(),[range_min, range_max, angle_max, certainty_min](Arrow& obj)
+                                                                                       { return obj.range > range_min &&
+                                                                                                obj.range < range_max &&
+                                                                                                std::abs(obj.angle) < angle_max &&
+                                                                                                obj.certainty > certainty_min;});
 }
 
-void NavSimple::findArrow() {
+bool NavSimple::findArrow()
+{
+  int direction;
+
+  bool cond = std::any_of(arrow_vector.begin(), arrow_vector.end(),[](Arrow& obj){ return obj.range < 2.0 &&
+                                                                                          obj.direction == "right" &&
+                                                                                          obj.certainty > 0.5;});
+
+  cond ? direction = 1
+       : direction = -1;
+
+  if(arrowFilter(2.0, 10.0, 15.0, 0.6) == arrow_vector.end())
+  {
     geometry_msgs::msg::Twist message;
-    int direction = 1;
-
-    for (size_t i = 0; i < arrow_range.size(); ++i) {
-        if (arrow_range[i] < 2.0 && arrow_direction[i] == "right" && arrow_certainty[i] > 0.5) {
-            RCLCPP_INFO(get_logger(), "Right arrow!");
-            direction = -1;
-            break;
-        }
-    }
-
     message.angular.z = 100.0;
     message.linear.x = direction * 0.05;
     publisher->publish(message);
-
-    while (arrowFilter(2.0, 10.0, 15.0, 0.6) == std::nullopt && autonomous_mode == 1) {
-        publisher->publish(message);
-        std::this_thread::sleep_for(100ms);
-    }
-
-    message.linear.x = 0.0;
-    message.angular.z = 0.0;
-    publisher->publish(message);
+    return false;
+  }
+  else
+    return true;
 }
 
-void NavSimple::approachArrow() {
-    geometry_msgs::msg::Twist message;
-    message.linear.x = 0.07;
+void NavSimple::approachArrow()
+{
+  geometry_msgs::msg::Twist message;
+  double error;
 
-    int arrival = 0, lost_counter = 0;
-    double error = 0.0;
+  message.linear.x = 0.07;
 
-    while (arrival < 1 && autonomous_mode == 1) {
-        auto arrow = arrowFilter(1.0, 1.5, 100.0, 0.6);
-        if (arrow) {
-            RCLCPP_INFO(get_logger(), "Arrived!");
-            std::this_thread::sleep_for(5s);
-            arrival = 1;
-            break;
-        }
+  if(arrowFilter(1.0, 1.5, 100.0, 0.6) != arrow_vector.end())
+  {
+    RCLCPP_INFO(get_logger(), "eureka arrived");
+  }
+  else
+  {
+    auto arrow = arrowFilter(1.5, maximum_range, 100.0, 0.6);
 
-        arrow = arrowFilter(1.5, maximum_range, 100.0, 0.6);
-        if (arrow) {
-            lost_counter = 0;
-            maximum_range = std::get<0>(*arrow) + 0.5;
-            error = std::get<1>(*arrow);
-        } else if (++lost_counter > 10) {
-            message.linear.x = 0.0;
-            message.angular.z = 0.0;
-            publisher->publish(message);
-            RCLCPP_WARN(get_logger(), "Arrow lost!");
-            return;
-        }
-
-        message.angular.z = -error * p_gain;
-        publisher->publish(message);
-        std::this_thread::sleep_for(100ms);
+    if(arrow != arrow_vector.end())
+    {
+      lost_counter = 0;
+      maximum_range = (*arrow).range + 0.5;
+      error = (*arrow).angle;
+      message.angular.z = -error * p_gain;
+      publisher->publish(message);
     }
-
-    message.linear.x = 0.0;
-    message.angular.z = 0.0;
-    publisher->publish(message);
+    else if (lost_counter > 10)
+    {
+      lost_counter++;
+      message.linear.x = 0.0;
+      message.angular.z = 0.0;
+      publisher->publish(message);
+      RCLCPP_WARN(get_logger(), "Arrow lost!");
+    }
+  }
 }
 
-void NavSimple::pipeline() {
-    while (rclcpp::ok()) {
-        if (autonomous_mode == 1) {
-            findArrow();
-            std::this_thread::sleep_for(2s);
-            approachArrow();
-        }
-        std::this_thread::sleep_for(5s);
-    }
-}
+int main(int argc, char* argv[])
+{
+  rclcpp::init(argc, argv);
 
-int main(int argc, char* argv[]) {
-    rclcpp::init(argc, argv);
-    auto node = std::make_shared<NavSimple>();
-    rclcpp::spin(node);
-    rclcpp::shutdown();
-    return 0;
+  auto node = std::make_shared<NavSimple>();
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  executor.spin();
+
+  return 0;
 }

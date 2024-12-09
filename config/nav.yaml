@@ -1,0 +1,5 @@
+nav_simple_cv:
+  ros__parameters:
+    non_block_mode: false
+    pid_gain: 0.05
+    maximum_range: 10.0

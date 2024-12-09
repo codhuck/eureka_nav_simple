@@ -18,11 +18,11 @@ endforeach()
 
 include_directories(include/)
 
-add_executable(${PROJECT_NAME}
+add_executable(eureka_simple_cv
   src/nav_simple.cpp
 )
 
-ament_target_dependencies(${PROJECT_NAME}
+ament_target_dependencies(eureka_simple_cv
   rclcpp
   sensor_msgs
   geometry_msgs
@@ -30,12 +30,12 @@ ament_target_dependencies(${PROJECT_NAME}
 
 # INSTALL
 install(TARGETS 
-  ${PROJECT_NAME}
+  eureka_simple_cv
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
-  DIRECTORY launch
+  DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}/
 )
 
